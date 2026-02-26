@@ -1,0 +1,1311 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  AWS PDF Translation Application - Main Stack
+  Deploys a serverless PDF translation service with authentication,
+  storage, and processing capabilities.
+  
+  FIXES APPLIED:
+  - Fixed bucket naming consistency (outputs vs output)
+  - Fixed circular dependency with S3 notification
+  - Fixed Lambda to use fpdf2 instead of reportlab (more widely available)
+  - Added ProductionDomain parameter
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment environment
+  
+  ProjectName:
+    Type: String
+    Default: pdf-translator
+    Description: Project name used for resource naming
+  
+  AllowedOrigins:
+    Type: String
+    Default: '*'
+    Description: CORS allowed origins (use specific domain in production)
+
+  ProductionDomain:
+    Type: String
+    Default: 'your-domain.com'
+    Description: Production domain for Cognito callbacks
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90]
+    Description: CloudWatch log retention period
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - AllowedOrigins
+          - ProductionDomain
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - LogRetentionDays
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, 'prod']
+  IsNotProd: !Not [!Equals [!Ref Environment, 'prod']]
+
+Resources:
+  # ============================================================================
+  # S3 BUCKETS
+  # ============================================================================
+  
+  # FIX: Removed NotificationConfiguration from UploadBucket to avoid circular dependency
+  # S3 notification is now configured separately via S3NotificationConfiguration
+  UploadBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${ProjectName}-uploads-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+          - Id: DeleteOldUploads
+            Status: Enabled
+            ExpirationInDays: 7
+            Prefix: uploads/
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, PUT, POST]
+            AllowedOrigins: 
+              - !Ref AllowedOrigins
+            MaxAge: 3600
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # FIX: Changed bucket name from 'output' to 'outputs' for consistency
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${ProjectName}-outputs-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: MoveToInfrequentAccess
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+          - Id: DeleteOldOutputs
+            Status: Enabled
+            ExpirationInDays: 90
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET]
+            AllowedOrigins: 
+              - !Ref AllowedOrigins
+            MaxAge: 3600
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-frontend-${Environment}-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ============================================================================
+  # DYNAMODB TABLE
+  # ============================================================================
+
+  JobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-jobs-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: jobId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: jobId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: UserIndex
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProd, true, false]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ============================================================================
+  # COGNITO USER POOL
+  # ============================================================================
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${ProjectName}-users-${Environment}'
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      MfaConfiguration: 'OFF'
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: true
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+        - Name: name
+          Required: false
+          Mutable: true
+      UserPoolTags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+
+  # FIX: Parameterized production domain
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub '${ProjectName}-client-${Environment}'
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      PreventUserExistenceErrors: ENABLED
+      SupportedIdentityProviders:
+        - COGNITO
+      CallbackURLs:
+        - !If [IsProd, !Sub 'https://${ProductionDomain}/callback', 'http://localhost:3000/callback']
+      LogoutURLs:
+        - !If [IsProd, !Sub 'https://${ProductionDomain}', 'http://localhost:3000']
+      AllowedOAuthFlows:
+        - code
+        - implicit
+      AllowedOAuthScopes:
+        - email
+        - openid
+        - profile
+      AllowedOAuthFlowsUserPoolClient: true
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+
+  # ============================================================================
+  # IAM ROLES
+  # ============================================================================
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub '${UploadBucket.Arn}/*'
+                  - !Sub '${OutputBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt UploadBucket.Arn
+                  - !GetAtt OutputBucket.Arn
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt JobsTable.Arn
+                  - !Sub '${JobsTable.Arn}/index/*'
+        - PolicyName: TranslateAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - translate:TranslateText
+                  - translate:TranslateDocument
+                  - comprehend:DetectDominantLanguage
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ============================================================================
+  # LAMBDA FUNCTIONS
+  # ============================================================================
+
+  UploadLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-upload-${Environment}'
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          UPLOAD_BUCKET: !Ref UploadBucket
+          JOBS_TABLE: !Ref JobsTable
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import os
+          from datetime import datetime, timedelta
+          from botocore.exceptions import ClientError
+
+          s3_client = boto3.client('s3')
+          dynamodb = boto3.resource('dynamodb')
+
+          def handler(event, context):
+              """Generate presigned URL for PDF upload and create job record."""
+              try:
+                  # Parse request
+                  body = json.loads(event.get('body', '{}'))
+                  user_id = event['requestContext']['authorizer']['claims']['sub']
+                  
+                  filename = body.get('filename', 'document.pdf')
+                  target_language = body.get('targetLanguage', 'es')
+                  source_language = body.get('sourceLanguage', 'auto')
+                  
+                  # Validate input
+                  if not filename.lower().endswith('.pdf'):
+                      return response(400, {'error': 'Only PDF files are supported'})
+                  
+                  # Generate job ID and S3 key
+                  job_id = str(uuid.uuid4())
+                  s3_key = f"uploads/{user_id}/{job_id}/{filename}"
+                  
+                  # Generate presigned URL
+                  presigned_url = s3_client.generate_presigned_url(
+                      'put_object',
+                      Params={
+                          'Bucket': os.environ['UPLOAD_BUCKET'],
+                          'Key': s3_key,
+                          'ContentType': 'application/pdf'
+                      },
+                      ExpiresIn=3600
+                  )
+                  
+                  # Create job record
+                  table = dynamodb.Table(os.environ['JOBS_TABLE'])
+                  now = datetime.utcnow()
+                  ttl = int((now + timedelta(days=30)).timestamp())
+                  
+                  table.put_item(Item={
+                      'jobId': job_id,
+                      'userId': user_id,
+                      'filename': filename,
+                      'sourceLanguage': source_language,
+                      'targetLanguage': target_language,
+                      'status': 'PENDING_UPLOAD',
+                      'createdAt': now.isoformat(),
+                      'updatedAt': now.isoformat(),
+                      's3Key': s3_key,
+                      'ttl': ttl
+                  })
+                  
+                  return response(200, {
+                      'jobId': job_id,
+                      'uploadUrl': presigned_url,
+                      'message': 'Upload URL generated successfully'
+                  })
+                  
+              except ClientError as e:
+                  print(f"AWS Error: {e}")
+                  return response(500, {'error': 'Failed to generate upload URL'})
+              except Exception as e:
+                  print(f"Error: {e}")
+                  return response(500, {'error': 'Internal server error'})
+
+          def response(status_code, body):
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                      'Access-Control-Allow-Methods': 'OPTIONS,POST,GET'
+                  },
+                  'body': json.dumps(body)
+              }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # FIX: Removed reportlab dependency, using fpdf2 layer or text-based output
+  # FIX: Added fpdf2 layer which is available in Klayers
+  TranslateLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-translate-${Environment}'
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 1024
+      TracingConfig:
+        Mode: Active
+      Layers:
+        # PyPDF2 for reading PDFs
+        - !Sub 'arn:aws:lambda:${AWS::Region}:770693421928:layer:Klayers-p311-PyPDF2:1'
+        # fpdf2 for creating PDFs (available in Klayers)
+        - !Sub 'arn:aws:lambda:${AWS::Region}:770693421928:layer:Klayers-p311-fpdf2:1'
+      Environment:
+        Variables:
+          UPLOAD_BUCKET: !Ref UploadBucket
+          OUTPUT_BUCKET: !Ref OutputBucket
+          JOBS_TABLE: !Ref JobsTable
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          from botocore.exceptions import ClientError
+          import io
+          
+          s3_client = boto3.client('s3')
+          translate_client = boto3.client('translate')
+          comprehend_client = boto3.client('comprehend')
+          dynamodb = boto3.resource('dynamodb')
+
+          def handler(event, context):
+              """Process S3 upload event and translate PDF content."""
+              try:
+                  # Parse S3 event
+                  for record in event.get('Records', []):
+                      bucket = record['s3']['bucket']['name']
+                      key = record['s3']['object']['key']
+                      
+                      # Extract job info from key
+                      parts = key.split('/')
+                      if len(parts) < 4:
+                          print(f"Invalid key format: {key}")
+                          continue
+                      
+                      user_id = parts[1]
+                      job_id = parts[2]
+                      
+                      # Update job status
+                      table = dynamodb.Table(os.environ['JOBS_TABLE'])
+                      update_job_status(table, job_id, 'PROCESSING')
+                      
+                      try:
+                          # Get job details
+                          job = table.get_item(Key={'jobId': job_id})['Item']
+                          target_lang = job.get('targetLanguage', 'es')
+                          source_lang = job.get('sourceLanguage', 'auto')
+                          
+                          # Download and process PDF
+                          pdf_content = download_pdf(bucket, key)
+                          text_content = extract_text_from_pdf(pdf_content)
+                          
+                          if not text_content.strip():
+                              update_job_status(table, job_id, 'FAILED', 'No text found in PDF')
+                              continue
+                          
+                          # Detect source language if auto
+                          if source_lang == 'auto':
+                              source_lang = detect_language(text_content[:5000])
+                          
+                          # Translate text
+                          translated_text = translate_text(text_content, source_lang, target_lang)
+                          
+                          # Create output PDF
+                          output_key = f"translated/{user_id}/{job_id}/translated_{job['filename']}"
+                          create_translated_pdf(translated_text, output_key, job['filename'])
+                          
+                          # Generate download URL
+                          download_url = s3_client.generate_presigned_url(
+                              'get_object',
+                              Params={'Bucket': os.environ['OUTPUT_BUCKET'], 'Key': output_key},
+                              ExpiresIn=86400
+                          )
+                          
+                          # Update job with success
+                          table.update_item(
+                              Key={'jobId': job_id},
+                              UpdateExpression='SET #status = :status, downloadUrl = :url, outputKey = :key, updatedAt = :time, detectedLanguage = :lang',
+                              ExpressionAttributeNames={'#status': 'status'},
+                              ExpressionAttributeValues={
+                                  ':status': 'COMPLETED',
+                                  ':url': download_url,
+                                  ':key': output_key,
+                                  ':time': datetime.utcnow().isoformat(),
+                                  ':lang': source_lang
+                              }
+                          )
+                          
+                      except Exception as e:
+                          print(f"Processing error for job {job_id}: {e}")
+                          update_job_status(table, job_id, 'FAILED', str(e))
+                  
+                  return {'statusCode': 200, 'body': 'Processing complete'}
+                  
+              except Exception as e:
+                  print(f"Handler error: {e}")
+                  return {'statusCode': 500, 'body': str(e)}
+
+          def download_pdf(bucket, key):
+              response = s3_client.get_object(Bucket=bucket, Key=key)
+              return response['Body'].read()
+
+          def extract_text_from_pdf(pdf_content):
+              try:
+                  from PyPDF2 import PdfReader
+                  reader = PdfReader(io.BytesIO(pdf_content))
+                  text = ""
+                  for page in reader.pages:
+                      text += page.extract_text() or ""
+                  return text
+              except Exception as e:
+                  print(f"PDF extraction error: {e}")
+                  return ""
+
+          def detect_language(text):
+              try:
+                  response = comprehend_client.detect_dominant_language(Text=text)
+                  return response['Languages'][0]['LanguageCode']
+              except:
+                  return 'en'
+
+          def translate_text(text, source_lang, target_lang):
+              # Split text into chunks (Translate has 10000 byte limit)
+              max_chunk = 9000
+              chunks = [text[i:i+max_chunk] for i in range(0, len(text), max_chunk)]
+              
+              translated_chunks = []
+              for chunk in chunks:
+                  response = translate_client.translate_text(
+                      Text=chunk,
+                      SourceLanguageCode=source_lang,
+                      TargetLanguageCode=target_lang
+                  )
+                  translated_chunks.append(response['TranslatedText'])
+              
+              return ''.join(translated_chunks)
+
+          # FIX: Using fpdf2 instead of reportlab (fpdf2 is available as Lambda layer)
+          def create_translated_pdf(text, output_key, original_filename):
+              try:
+                  from fpdf import FPDF
+                  
+                  # Create PDF
+                  pdf = FPDF()
+                  pdf.add_page()
+                  pdf.set_auto_page_break(auto=True, margin=15)
+                  
+                  # Use a built-in font that supports basic characters
+                  pdf.set_font('Helvetica', size=11)
+                  
+                  # Add title
+                  pdf.set_font('Helvetica', 'B', 14)
+                  pdf.cell(0, 10, f'Translated: {original_filename}', ln=True)
+                  pdf.ln(5)
+                  
+                  # Add content
+                  pdf.set_font('Helvetica', size=11)
+                  
+                  # Handle text encoding and line wrapping
+                  # fpdf2 handles unicode better than fpdf
+                  for line in text.split('\n'):
+                      # Encode to latin-1 with replacement for unsupported chars
+                      safe_line = line.encode('latin-1', errors='replace').decode('latin-1')
+                      pdf.multi_cell(0, 6, safe_line)
+                  
+                  # Save to buffer
+                  pdf_buffer = io.BytesIO()
+                  pdf.output(pdf_buffer)
+                  pdf_buffer.seek(0)
+                  
+                  # Upload to S3
+                  s3_client.put_object(
+                      Bucket=os.environ['OUTPUT_BUCKET'],
+                      Key=output_key,
+                      Body=pdf_buffer.getvalue(),
+                      ContentType='application/pdf'
+                  )
+                  
+              except ImportError:
+                  # Fallback: create a text file if fpdf2 is not available
+                  print("fpdf2 not available, creating text file instead")
+                  content = f"Translated Document: {original_filename}\n\n{text}"
+                  s3_client.put_object(
+                      Bucket=os.environ['OUTPUT_BUCKET'],
+                      Key=output_key.replace('.pdf', '.txt'),
+                      Body=content.encode('utf-8'),
+                      ContentType='text/plain'
+                  )
+              except Exception as e:
+                  print(f"PDF creation error: {e}")
+                  # Fallback to text
+                  content = f"Translated Document: {original_filename}\n\n{text}"
+                  s3_client.put_object(
+                      Bucket=os.environ['OUTPUT_BUCKET'],
+                      Key=output_key.replace('.pdf', '.txt'),
+                      Body=content.encode('utf-8'),
+                      ContentType='text/plain'
+                  )
+
+          def update_job_status(table, job_id, status, error=None):
+              update_expr = 'SET #status = :status, updatedAt = :time'
+              expr_values = {
+                  ':status': status,
+                  ':time': datetime.utcnow().isoformat()
+              }
+              if error:
+                  update_expr += ', errorMessage = :error'
+                  expr_values[':error'] = error
+              
+              table.update_item(
+                  Key={'jobId': job_id},
+                  UpdateExpression=update_expr,
+                  ExpressionAttributeNames={'#status': 'status'},
+                  ExpressionAttributeValues=expr_values
+              )
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # FIX: Permission must be created BEFORE the S3 notification references the Lambda
+  TranslateLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TranslateLambda
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub 'arn:aws:s3:::${ProjectName}-uploads-${Environment}-${AWS::AccountId}'
+      SourceAccount: !Ref AWS::AccountId
+
+  # FIX: Custom resource to configure S3 notification after Lambda permission exists
+  # This avoids the circular dependency issue
+  S3NotificationCustomResource:
+    Type: Custom::S3BucketNotification
+    DependsOn: 
+      - TranslateLambdaPermission
+      - UploadBucket
+    Properties:
+      ServiceToken: !GetAtt S3NotificationLambda.Arn
+      BucketName: !Ref UploadBucket
+      NotificationConfiguration:
+        LambdaFunctionConfigurations:
+          - Events:
+              - 's3:ObjectCreated:*'
+            LambdaFunctionArn: !GetAtt TranslateLambda.Arn
+            Filter:
+              Key:
+                FilterRules:
+                  - Name: prefix
+                    Value: uploads/
+
+  S3NotificationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-s3-notification-${Environment}'
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt S3NotificationLambdaRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import json
+          
+          s3 = boto3.client('s3')
+          
+          def handler(event, context):
+              try:
+                  bucket = event['ResourceProperties']['BucketName']
+                  notification_config = event['ResourceProperties'].get('NotificationConfiguration', {})
+                  
+                  if event['RequestType'] in ['Create', 'Update']:
+                      # Build the notification configuration
+                      config = {}
+                      
+                      if 'LambdaFunctionConfigurations' in notification_config:
+                          config['LambdaFunctionConfigurations'] = []
+                          for lfc in notification_config['LambdaFunctionConfigurations']:
+                              lambda_config = {
+                                  'LambdaFunctionArn': lfc['LambdaFunctionArn'],
+                                  'Events': lfc['Events']
+                              }
+                              if 'Filter' in lfc:
+                                  lambda_config['Filter'] = {
+                                      'Key': {
+                                          'FilterRules': lfc['Filter']['Key']['FilterRules']
+                                      }
+                                  }
+                              config['LambdaFunctionConfigurations'].append(lambda_config)
+                      
+                      s3.put_bucket_notification_configuration(
+                          Bucket=bucket,
+                          NotificationConfiguration=config
+                      )
+                  
+                  elif event['RequestType'] == 'Delete':
+                      s3.put_bucket_notification_configuration(
+                          Bucket=bucket,
+                          NotificationConfiguration={}
+                      )
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  
+              except Exception as e:
+                  print(f"Error: {e}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  S3NotificationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-s3-notification-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3NotificationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutBucketNotification
+                  - s3:GetBucketNotification
+                Resource: !Sub 'arn:aws:s3:::${ProjectName}-uploads-${Environment}-${AWS::AccountId}'
+
+  StatusLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-status-${Environment}'
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          JOBS_TABLE: !Ref JobsTable
+          OUTPUT_BUCKET: !Ref OutputBucket
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from boto3.dynamodb.conditions import Key
+          from botocore.exceptions import ClientError
+
+          dynamodb = boto3.resource('dynamodb')
+          s3_client = boto3.client('s3')
+
+          def handler(event, context):
+              """Get job status or list user's jobs."""
+              try:
+                  user_id = event['requestContext']['authorizer']['claims']['sub']
+                  path_params = event.get('pathParameters') or {}
+                  job_id = path_params.get('jobId')
+                  
+                  table = dynamodb.Table(os.environ['JOBS_TABLE'])
+                  
+                  if job_id:
+                      # Get specific job
+                      result = table.get_item(Key={'jobId': job_id})
+                      job = result.get('Item')
+                      
+                      if not job:
+                          return response(404, {'error': 'Job not found'})
+                      
+                      if job['userId'] != user_id:
+                          return response(403, {'error': 'Access denied'})
+                      
+                      # Refresh download URL if completed
+                      if job.get('status') == 'COMPLETED' and job.get('outputKey'):
+                          job['downloadUrl'] = s3_client.generate_presigned_url(
+                              'get_object',
+                              Params={
+                                  'Bucket': os.environ['OUTPUT_BUCKET'],
+                                  'Key': job['outputKey']
+                              },
+                              ExpiresIn=86400
+                          )
+                      
+                      # Remove internal fields
+                      job.pop('s3Key', None)
+                      job.pop('outputKey', None)
+                      job.pop('ttl', None)
+                      
+                      return response(200, job)
+                  else:
+                      # List user's jobs
+                      result = table.query(
+                          IndexName='UserIndex',
+                          KeyConditionExpression=Key('userId').eq(user_id),
+                          ScanIndexForward=False,
+                          Limit=50
+                      )
+                      
+                      jobs = []
+                      for job in result.get('Items', []):
+                          jobs.append({
+                              'jobId': job['jobId'],
+                              'filename': job['filename'],
+                              'status': job['status'],
+                              'targetLanguage': job['targetLanguage'],
+                              'createdAt': job['createdAt']
+                          })
+                      
+                      return response(200, {'jobs': jobs})
+                      
+              except ClientError as e:
+                  print(f"AWS Error: {e}")
+                  return response(500, {'error': 'Database error'})
+              except Exception as e:
+                  print(f"Error: {e}")
+                  return response(500, {'error': 'Internal server error'})
+
+          def response(status_code, body):
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                      'Access-Control-Allow-Methods': 'OPTIONS,GET'
+                  },
+                  'body': json.dumps(body)
+              }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ============================================================================
+  # API GATEWAY
+  # ============================================================================
+
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-api-${Environment}'
+      Description: PDF Translation API
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  ApiGatewayAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: CognitoAuthorizer
+      Type: COGNITO_USER_POOLS
+      RestApiId: !Ref ApiGateway
+      IdentitySource: method.request.header.Authorization
+      ProviderARNs:
+        - !GetAtt UserPool.Arn
+
+  # Upload endpoint
+  UploadResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: upload
+
+  UploadMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref UploadResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ApiGatewayAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UploadLambda.Arn}/invocations'
+
+  UploadOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref UploadResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # Jobs endpoint
+  JobsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: jobs
+
+  JobsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref JobsResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ApiGatewayAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${StatusLambda.Arn}/invocations'
+
+  JobsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref JobsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,GET'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # Single job endpoint
+  JobResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref JobsResource
+      PathPart: '{jobId}'
+
+  JobMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref JobResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ApiGatewayAuthorizer
+      RequestParameters:
+        method.request.path.jobId: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${StatusLambda.Arn}/invocations'
+
+  JobOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref JobResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,GET'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # Lambda permissions for API Gateway
+  UploadLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UploadLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*'
+
+  StatusLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref StatusLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*'
+
+  # API Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - UploadMethod
+      - JobsMethod
+      - JobMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref ApiGateway
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref Environment
+      TracingEnabled: true
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          MetricsEnabled: true
+          DataTraceEnabled: !If [IsNotProd, true, false]
+          LoggingLevel: !If [IsNotProd, 'INFO', 'ERROR']
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ============================================================================
+  # CLOUDFRONT DISTRIBUTION
+  # ============================================================================
+
+  CloudFrontOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${ProjectName}-oac-${Environment}'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !Ref CloudFrontOriginAccessControl
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+
+  # ============================================================================
+  # CLOUDWATCH MONITORING
+  # ============================================================================
+
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-errors-${Environment}'
+      AlarmDescription: Alert when Lambda functions have errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TranslateLambda
+
+  ApiGateway5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-api-5xx-${Environment}'
+      AlarmDescription: Alert when API has 5xx errors
+      MetricName: 5XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub '${ProjectName}-api-${Environment}'
+
+  # Log Groups
+  UploadLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${UploadLambda}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  TranslateLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${TranslateLambda}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  StatusLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${StatusLambda}'
+      RetentionInDays: !Ref LogRetentionDays
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${ProjectName}-ApiEndpoint-${Environment}'
+
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub '${ProjectName}-UserPoolId-${Environment}'
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub '${ProjectName}-UserPoolClientId-${Environment}'
+
+  UploadBucketName:
+    Description: S3 bucket for uploads
+    Value: !Ref UploadBucket
+    Export:
+      Name: !Sub '${ProjectName}-UploadBucket-${Environment}'
+
+  OutputBucketName:
+    Description: S3 bucket for translated outputs
+    Value: !Ref OutputBucket
+    Export:
+      Name: !Sub '${ProjectName}-OutputBucket-${Environment}'
+
+  FrontendBucketName:
+    Description: S3 bucket for frontend
+    Value: !Ref FrontendBucket
+    Export:
+      Name: !Sub '${ProjectName}-FrontendBucket-${Environment}'
+
+  CloudFrontDomain:
+    Description: CloudFront distribution domain
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub '${ProjectName}-CloudFrontDomain-${Environment}'
+
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID
+    Value: !Ref CloudFrontDistribution
+    Export:
+      Name: !Sub '${ProjectName}-CloudFrontDistId-${Environment}'
+
+  JobsTableName:
+    Description: DynamoDB jobs table name
+    Value: !Ref JobsTable
+    Export:
+      Name: !Sub '${ProjectName}-JobsTable-${Environment}'
